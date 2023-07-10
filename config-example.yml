@@ -34,7 +34,7 @@ graphhopper:
   profiles:
     - name: car
       vehicle: car
-      weighting: custom
+      weighting: shortest
       custom_model:
         distance_influence: 70
 #      turn_costs: true
@@ -87,6 +87,7 @@ graphhopper:
   #           hazmat,hazmat_tunnel,hazmat_water,lanes,osm_way_id,toll,track_type,mtb_rating,hike_rating,horse_rating,
   #           country,curvature,average_slope,max_slope
   # graph.encoded_values: surface,toll,track_type
+  graph.encoded_values: osm_way_id
 
   #### Speed, hybrid and flexible mode ####
 

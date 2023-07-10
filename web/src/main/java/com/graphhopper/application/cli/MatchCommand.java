@@ -18,29 +18,38 @@
 
 package com.graphhopper.application.cli;
 
-import com.fasterxml.jackson.dataformat.xml.XmlMapper;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.nio.charset.Charset;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Scanner;
+import java.util.regex.Pattern;
+
+import com.csvreader.CsvReader;
+import com.csvreader.CsvWriter;
 import com.graphhopper.GraphHopper;
 import com.graphhopper.GraphHopperConfig;
-import com.graphhopper.ResponsePath;
 import com.graphhopper.application.GraphHopperServerConfiguration;
-import com.graphhopper.gpx.GpxConversions;
 import com.graphhopper.jackson.Gpx;
 import com.graphhopper.matching.MapMatching;
 import com.graphhopper.matching.MatchResult;
 import com.graphhopper.matching.Observation;
-import com.graphhopper.util.*;
+import com.graphhopper.routing.ev.IntEncodedValue;
+import com.graphhopper.storage.Graph;
+import com.graphhopper.storage.NodeAccess;
+import com.graphhopper.util.EdgeIteratorState;
+import com.graphhopper.util.PMap;
+import com.graphhopper.util.StopWatch;
+import com.graphhopper.util.shapes.GHPoint3D;
+
 import io.dropwizard.cli.ConfiguredCommand;
 import io.dropwizard.setup.Bootstrap;
 import net.sourceforge.argparse4j.inf.Argument;
 import net.sourceforge.argparse4j.inf.Namespace;
 import net.sourceforge.argparse4j.inf.Subparser;
-
-import java.io.BufferedWriter;
-import java.io.File;
-import java.io.FileWriter;
-import java.util.Collections;
-import java.util.Date;
-import java.util.List;
 
 public class MatchCommand extends ConfiguredCommand<GraphHopperServerConfiguration> {
 
@@ -50,11 +59,11 @@ public class MatchCommand extends ConfiguredCommand<GraphHopperServerConfigurati
 
     @Override
     public void configure(Subparser subparser) {
-        subparser.addArgument("gpx")
+        subparser.addArgument("csv")
                 .type(File.class)
                 .required(true)
                 .nargs("+")
-                .help("GPX file");
+                .help("CSV file");
         subparser.addArgument("--file")
                 .required(true)
                 .help("application configuration file");
@@ -62,11 +71,6 @@ public class MatchCommand extends ConfiguredCommand<GraphHopperServerConfigurati
                 .type(String.class)
                 .required(true)
                 .help("profile to use for map-matching (must be configured in configuration file)");
-        subparser.addArgument("--instructions")
-                .type(String.class)
-                .required(false)
-                .setDefault("")
-                .help("Locale for instructions");
         subparser.addArgument("--gps_accuracy")
                 .type(Integer.class)
                 .required(false)
@@ -102,46 +106,53 @@ public class MatchCommand extends ConfiguredCommand<GraphHopperServerConfigurati
 
         StopWatch importSW = new StopWatch();
         StopWatch matchSW = new StopWatch();
+        
+        IntEncodedValue osmWay = hopper.getEncodingManager().getIntEncodedValue("osm_way_id");
 
-        Translation tr = new TranslationMap().doImport().getWithFallBack(Helper.getLocale(args.getString("instructions")));
-        final boolean withRoute = !args.getString("instructions").isEmpty();
-        XmlMapper xmlMapper = new XmlMapper();
-
-        for (File gpxFile : args.<File>getList("gpx")) {
-            try {
+        for (File gpxFile : args.<File>getList("csv")) {
+        	String outFile = gpxFile.getAbsolutePath() + ".res.csv";
+            try (FileInputStream fis = new FileInputStream(gpxFile);
+            	 FileOutputStream fos = new FileOutputStream(outFile)) {
                 importSW.start();
-                Gpx gpx = xmlMapper.readValue(gpxFile, Gpx.class);
-                if (gpx.trk == null) {
-                    throw new IllegalArgumentException("No tracks found in GPX document. Are you using waypoints or routes instead?");
+                CsvReader csvReader = new CsvReader(fis, Charset.forName("UTF-8"));
+                if (!csvReader.readHeaders()) {
+                	throw new IllegalArgumentException(String.format("File %s does not contain header", gpxFile.getName()));
                 }
-                if (gpx.trk.size() > 1) {
-                    throw new IllegalArgumentException("GPX documents with multiple tracks not supported yet.");
+                csvReader.setSafetySwitch(false);
+                CsvWriter csvWriter = new CsvWriter(fos, ',', Charset.forName("UTF-8"));
+                csvWriter.writeRecord(new String []{"id", "order", "origin_lat", "origin_long", "destination_lat", "destination_long", "trip_event", "osm_way_id"});
+                
+                int order = 1;
+                while (csvReader.readRecord()) {
+                	String id = csvReader.get("id");
+                	String path = csvReader.get("path");
+                	List<Observation> measurements = getEntries(path);
+                	importSW.stop();
+                	matchSW.start();
+                	MatchResult mr = mapMatching.match(measurements);
+                	matchSW.stop();
+                	
+                	Graph gr = mr.getGraph();
+                	NodeAccess nodeAccess = gr.getNodeAccess();
+                	List<EdgeIteratorState> edges = mr.getMergedPath().calcEdges();
+					int firstNodeIdx = edges.get(0).getBaseNode();
+					order = 1;
+                	csvWriter.writeRecord(getNodeEvent(nodeAccess, firstNodeIdx, "start", id, order++));
+                	for (EdgeIteratorState ed: edges) {
+                		csvWriter.writeRecord(getEdgeEvent(nodeAccess, ed, id, order++, osmWay));
+                	}
+                	int lastNodeIdx = edges.get(edges.size()-1).getAdjNode();
+                	csvWriter.writeRecord(getNodeEvent(nodeAccess, lastNodeIdx, "end", id, order));
+                	importSW.start();
                 }
-                List<Observation> measurements = GpxConversions.getEntries(gpx.trk.get(0));
                 importSW.stop();
-                matchSW.start();
-                MatchResult mr = mapMatching.match(measurements);
-                matchSW.stop();
+                
                 System.out.println(gpxFile);
-                System.out.println("\tmatches:\t" + mr.getEdgeMatches().size() + ", gps entries:" + measurements.size());
-                System.out.println("\tgpx length:\t" + (float) mr.getGpxEntriesLength() + " vs " + (float) mr.getMatchLength());
-
-                String outFile = gpxFile.getAbsolutePath() + ".res.gpx";
                 System.out.println("\texport results to:" + outFile);
 
-                ResponsePath responsePath = new PathMerger(mr.getGraph(), mr.getWeighting()).
-                        doWork(PointList.EMPTY, Collections.singletonList(mr.getMergedPath()), hopper.getEncodingManager(), tr);
-                if (responsePath.hasErrors()) {
-                    System.err.println("Problem with file " + gpxFile + ", " + responsePath.getErrors());
-                    continue;
-                }
-
-                try (BufferedWriter writer = new BufferedWriter(new FileWriter(outFile))) {
-                    long time = gpx.trk.get(0).getStartTime()
-                            .map(Date::getTime)
-                            .orElse(System.currentTimeMillis());
-                    writer.append(GpxConversions.createGPX(responsePath.getInstructions(), gpx.trk.get(0).name != null ? gpx.trk.get(0).name : "", time, hopper.hasElevation(), withRoute, true, false, Constants.VERSION, tr));
-                }
+                csvWriter.close();
+                csvReader.close();
+                
             } catch (Exception ex) {
                 importSW.stop();
                 matchSW.stop();
@@ -150,6 +161,45 @@ public class MatchCommand extends ConfiguredCommand<GraphHopperServerConfigurati
             }
         }
         System.out.println("gps import took:" + importSW.getSeconds() + "s, match took: " + matchSW.getSeconds());
+    }
+    
+    private String [] getNodeEvent(NodeAccess nodeAccess, int nodeIndex, String tripEvent,  String id, int order) {
+    	return new String[] {id, ""+order, 
+    			""+nodeAccess.getLat(nodeIndex),""+nodeAccess.getLon(nodeIndex),
+    			""+nodeAccess.getLat(nodeIndex),""+nodeAccess.getLon(nodeIndex), 
+    			tripEvent, ""};
+    }
+    
+    private String [] getEdgeEvent(NodeAccess nodeAccess, EdgeIteratorState edge, String id, int order, IntEncodedValue osmWay) {
+    	int originIndex = edge.getBaseNode();
+    	int destinationIndex = edge.getAdjNode();
+    	
+    	return new String[] {id, ""+order, 
+    			""+nodeAccess.getLat(originIndex),""+nodeAccess.getLon(originIndex),
+    			""+nodeAccess.getLat(destinationIndex),""+nodeAccess.getLon(destinationIndex), 
+    			"route", ""+edge.get(osmWay)};
+    }
+    
+    public static List<Observation> getEntries(String path) {
+    	ArrayList<Observation> gpxEntries = new ArrayList<>();
+    	try (Scanner scanner = new Scanner(path).useDelimiter(Pattern.compile("[ \\t\\n,\\[\\]]+")).useLocale(Locale.US)) {
+    		
+    		while (scanner.hasNextDouble()) {
+    			double lon = scanner.nextDouble();
+        		double lat = scanner.nextDouble();
+        		
+        		gpxEntries.add(new Observation(new GHPoint3D(lat, lon, 0)));
+    		}
+    		
+    		/*
+    		String lonS = scanner.next();
+    		String latS = scanner.next();
+    		
+    		double lat = Double.parseDouble(latS);
+    		double lon = Double.parseDouble(lonS);*/
+    		
+    	}
+        return gpxEntries;
     }
 
 }
